@@ -1,0 +1,5 @@
+node_modules
+dist
+.env
+yt-dlp.exe
+yt-dlp
