@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { buscar, type Fonte } from './search.js';
 import { resolver } from './source.js';
-import type { Sessoes } from './session.js';
+import { FilaCheiaError, type Sessoes } from './session.js';
 
 interface Contexto {
   sessoes: Sessoes;
@@ -47,6 +47,11 @@ export function criarServidor(ctx: Contexto) {
     void atender(ctx, req, res).catch((causa) => {
       if (causa instanceof ErroDePedido) {
         responder(res, causa.status, { erro: causa.message });
+        return;
+      }
+
+      if (causa instanceof FilaCheiaError) {
+        responder(res, 409, { erro: causa.message });
         return;
       }
 

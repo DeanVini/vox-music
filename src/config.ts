@@ -51,6 +51,9 @@ export const config = {
   canais: 2,
   amostrasPorQuadro: 480,
   filaDeAudioMs: 1000,
+
+  ociosidadeMs: Number(process.env.OCIOSIDADE_MS ?? 5 * 60_000),
+  limiteDaFila: Number(process.env.LIMITE_DA_FILA ?? 50),
 };
 
 export type Config = typeof config;

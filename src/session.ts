@@ -3,6 +3,7 @@ import {
   AudioSource,
   LocalAudioTrack,
   Room,
+  RoomEvent,
   TrackPublishOptions,
   TrackSource,
 } from '@livekit/rtc-node';
@@ -12,6 +13,12 @@ import { Reprodutor } from './player.js';
 import type { Faixa } from './source.js';
 
 export const TOPICO = 'vox:musica';
+
+export class FilaCheiaError extends Error {
+  constructor(readonly limite: number) {
+    super(`A fila já tem ${limite} músicas. Espere ou remova alguma.`);
+  }
+}
 
 export interface ItemDaFila extends Faixa {
   pedidoPor: string;
@@ -33,6 +40,8 @@ export class Sessao {
   private desde: number | null = null;
   private laco: Promise<void> | null = null;
   private encerrada = false;
+  private relogioDeOciosidade: ReturnType<typeof setTimeout> | null = null;
+  private aoSair: (() => void) | null = null;
 
   private constructor(
     readonly sala: string,
@@ -78,7 +87,13 @@ export class Sessao {
       }),
     );
 
-    return new Sessao(sala, room, fonte, new Reprodutor(fonte));
+    const sessao = new Sessao(sala, room, fonte, new Reprodutor(fonte));
+
+    room.on(RoomEvent.ParticipantDisconnected, () => sessao.conferirSala());
+    room.on(RoomEvent.ParticipantConnected, () => sessao.cancelarOciosidade());
+
+    sessao.agendarOciosidade();
+    return sessao;
   }
 
   estado(): EstadoDaSessao {
@@ -93,8 +108,14 @@ export class Sessao {
   }
 
   adicionar(faixa: Faixa, pedidoPor: string): ItemDaFila {
+    const naFrente = this.fila.length + (this.atual ? 1 : 0);
+    if (naFrente >= config.limiteDaFila) {
+      throw new FilaCheiaError(config.limiteDaFila);
+    }
+
     const item: ItemDaFila = { ...faixa, pedidoPor };
     this.fila.push(item);
+    this.cancelarOciosidade();
     this.anunciar();
     this.girar();
     return item;
@@ -133,11 +154,40 @@ export class Sessao {
 
   async sair(): Promise<void> {
     this.encerrada = true;
+    this.cancelarOciosidade();
     this.fila.length = 0;
     this.reprodutor.parar();
     await this.laco?.catch(() => undefined);
     await this.fonte.close().catch(() => undefined);
     await this.room.disconnect().catch(() => undefined);
+  }
+
+  aoEncerrarSozinha(callback: () => void): void {
+    this.aoSair = callback;
+  }
+
+  cancelarOciosidade(): void {
+    if (!this.relogioDeOciosidade) return;
+    clearTimeout(this.relogioDeOciosidade);
+    this.relogioDeOciosidade = null;
+  }
+
+  agendarOciosidade(): void {
+    this.cancelarOciosidade();
+    if (this.encerrada) return;
+
+    this.relogioDeOciosidade = setTimeout(() => {
+      this.relogioDeOciosidade = null;
+      if (this.atual || this.fila.length > 0) return;
+      this.aoSair?.();
+    }, config.ociosidadeMs);
+  }
+
+  conferirSala(): void {
+    if (this.encerrada) return;
+    if (this.room.remoteParticipants.size > 0) return;
+
+    this.aoSair?.();
   }
 
   private girar(): void {
@@ -166,6 +216,8 @@ export class Sessao {
       this.desde = null;
       this.anunciar();
     }
+
+    this.agendarOciosidade();
   }
 
   private anunciar(): void {
@@ -195,6 +247,13 @@ export class Sessoes {
 
     const nova = await Sessao.entrar(sala);
     this.porSala.set(sala, nova);
+
+    nova.aoEncerrarSozinha(() => {
+      if (this.porSala.get(sala) !== nova) return;
+      this.porSala.delete(sala);
+      void nova.sair();
+    });
+
     return nova;
   }
 
