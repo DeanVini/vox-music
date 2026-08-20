@@ -1,188 +1,187 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { buscar, type Fonte } from './search.js';
-import { resolver } from './source.js';
-import { FilaCheiaError, type Sessoes } from './session.js';
+import { search, type Source } from './search.js';
+import { resolve } from './source.js';
+import { QueueFullError, type Sessions } from './session.js';
 
-interface Contexto {
-  sessoes: Sessoes;
-  segredo: string | null;
+interface Context {
+  sessions: Sessions;
+  secret: string | null;
 }
 
-async function corpo(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const partes: Buffer[] = [];
-  for await (const p of req) partes.push(p as Buffer);
-  if (partes.length === 0) return {};
+class RequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const parts: Buffer[] = [];
+  for await (const p of req) parts.push(p as Buffer);
+  if (parts.length === 0) return {};
 
   try {
-    return JSON.parse(Buffer.concat(partes).toString('utf8')) as Record<string, unknown>;
+    return JSON.parse(Buffer.concat(parts).toString('utf8')) as Record<
+      string,
+      unknown
+    >;
   } catch {
-    throw new ErroDePedido(400, 'Corpo inválido: esperava JSON');
+    throw new RequestError(400, 'Corpo inválido: esperava JSON');
   }
 }
 
-class ErroDePedido extends Error {
-  constructor(readonly status: number, mensagem: string) {
-    super(mensagem);
-  }
-}
-
-function responder(res: ServerResponse, status: number, dados: unknown): void {
-  const corpo = JSON.stringify(dados);
+function reply(res: ServerResponse, status: number, data: unknown): void {
+  const body = JSON.stringify(data);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(corpo),
+    'content-length': Buffer.byteLength(body),
   });
-  res.end(corpo);
+  res.end(body);
 }
 
-function texto(valor: unknown, campo: string): string {
-  if (typeof valor !== 'string' || valor.trim().length === 0) {
-    throw new ErroDePedido(400, `Campo obrigatório: ${campo}`);
+function requireText(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new RequestError(400, `Campo obrigatório: ${field}`);
   }
-  return valor.trim();
+  return value.trim();
 }
 
-export function criarServidor(ctx: Contexto) {
+export function createHttpServer(ctx: Context) {
   return createServer((req, res) => {
-    void atender(ctx, req, res).catch((causa) => {
-      if (causa instanceof ErroDePedido) {
-        responder(res, causa.status, { erro: causa.message });
+    void handle(ctx, req, res).catch((cause) => {
+      if (cause instanceof RequestError) {
+        reply(res, cause.status, { error: cause.message });
         return;
       }
 
-      if (causa instanceof FilaCheiaError) {
-        responder(res, 409, { erro: causa.message });
+      if (cause instanceof QueueFullError) {
+        reply(res, 409, { error: cause.message });
         return;
       }
 
-      const mensagem = causa instanceof Error ? causa.message : String(causa);
-      responder(res, 500, { erro: mensagem });
+      const message = cause instanceof Error ? cause.message : String(cause);
+      reply(res, 500, { error: message });
     });
   });
 }
 
-async function atender(
-  ctx: Contexto,
+async function handle(
+  ctx: Context,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://interno');
-  const partes = url.pathname.split('/').filter(Boolean);
+  const url = new URL(req.url ?? '/', 'http://internal');
+  const parts = url.pathname.split('/').filter(Boolean);
 
-  if (req.method === 'GET' && url.pathname === '/saude') {
-    responder(res, 200, { ok: true, salas: ctx.sessoes.listar().length });
+  if (req.method === 'GET' && url.pathname === '/health') {
+    reply(res, 200, { ok: true, rooms: ctx.sessions.list().length });
     return;
   }
 
-  if (ctx.segredo && req.headers.authorization !== `Bearer ${ctx.segredo}`) {
-    responder(res, 401, { erro: 'Não autorizado' });
+  if (ctx.secret && req.headers.authorization !== `Bearer ${ctx.secret}`) {
+    reply(res, 401, { error: 'Não autorizado' });
     return;
   }
 
-  if (req.method === 'GET' && url.pathname === '/salas') {
-    responder(res, 200, { salas: ctx.sessoes.listar() });
+  if (req.method === 'GET' && url.pathname === '/rooms') {
+    reply(res, 200, { rooms: ctx.sessions.list() });
     return;
   }
 
-  if (partes[0] !== 'salas' || !partes[1]) {
-    responder(res, 404, { erro: 'Rota desconhecida' });
+  if (parts[0] !== 'rooms' || !parts[1]) {
+    reply(res, 404, { error: 'Rota desconhecida' });
     return;
   }
 
-  const sala = decodeURIComponent(partes[1]);
-  const acao = partes[2];
+  const roomName = decodeURIComponent(parts[1]);
+  const action = parts[2];
 
-  if (req.method === 'GET' && !acao) {
-    const sessao = ctx.sessoes.atual(sala);
-    responder(res, 200, { estado: sessao?.estado() ?? null });
+  if (req.method === 'GET' && !action) {
+    reply(res, 200, { state: ctx.sessions.current(roomName)?.state() ?? null });
     return;
   }
 
-  if (req.method === 'DELETE' && !acao) {
-    responder(res, 200, { saiu: await ctx.sessoes.encerrar(sala) });
+  if (req.method === 'DELETE' && !action) {
+    reply(res, 200, { left: await ctx.sessions.close(roomName) });
     return;
   }
 
-  if (req.method === 'POST' && acao === 'buscar') {
-    const dados = await corpo(req);
-    const consulta = texto(dados.consulta, 'consulta');
-    const fontes = Array.isArray(dados.fontes)
-      ? (dados.fontes as Fonte[])
+  if (req.method === 'POST' && action === 'search') {
+    const body = await readBody(req);
+    const query = requireText(body.query, 'query');
+    const sources = Array.isArray(body.sources)
+      ? (body.sources as Source[])
       : undefined;
 
-    const { resultados, falhas } = await buscar(consulta, {
-      porFonte: Number(dados.porFonte ?? 5),
-      fontes,
+    const { results, failures } = await search(query, {
+      perSource: Number(body.perSource ?? 5),
+      sources,
     });
 
-    responder(res, 200, { resultados, falhas });
+    reply(res, 200, { results, failures });
     return;
   }
 
-  if (req.method === 'POST' && acao === 'tocar') {
-    const dados = await corpo(req);
-    const alvo = texto(dados.pagina ?? dados.consulta, 'pagina ou consulta');
-    const pedidoPor = texto(dados.pedidoPor ?? 'alguém', 'pedidoPor');
+  if (req.method === 'POST' && action === 'play') {
+    const body = await readBody(req);
+    const target = requireText(body.page ?? body.query, 'page ou query');
+    const requestedBy = requireText(body.requestedBy ?? 'alguém', 'requestedBy');
 
-    const faixa = await resolver(alvo);
-    const sessao = await ctx.sessoes.obter(sala);
-    const item = sessao.adicionar(faixa, pedidoPor);
+    const track = await resolve(target);
+    const session = await ctx.sessions.get(roomName);
+    const item = session.add(track, requestedBy);
 
-    responder(res, 200, { adicionado: item, estado: sessao.estado() });
+    reply(res, 200, { added: item, state: session.state() });
     return;
   }
 
-  const sessao = ctx.sessoes.atual(sala);
-  if (!sessao) {
-    responder(res, 404, { erro: 'Nenhuma sessão nessa sala' });
+  const session = ctx.sessions.current(roomName);
+  if (!session) {
+    reply(res, 404, { error: 'Nenhuma sessão nessa sala' });
     return;
   }
 
-  if (req.method === 'POST' && acao === 'pular') {
-    responder(res, 200, { pulou: sessao.pular(), estado: sessao.estado() });
+  if (req.method === 'POST' && action === 'skip') {
+    reply(res, 200, { skipped: session.skip(), state: session.state() });
     return;
   }
 
-  if (req.method === 'POST' && acao === 'pausar') {
-    const dados = await corpo(req);
-    sessao.pausar(dados.pausado !== false);
-    responder(res, 200, { estado: sessao.estado() });
+  if (req.method === 'POST' && action === 'pause') {
+    const body = await readBody(req);
+    session.pause(body.paused !== false);
+    reply(res, 200, { state: session.state() });
     return;
   }
 
-  if (req.method === 'POST' && acao === 'volume') {
-    const dados = await corpo(req);
-    const valor = Number(dados.volume);
+  if (req.method === 'POST' && action === 'volume') {
+    const body = await readBody(req);
+    const value = Number(body.volume);
 
-    if (!Number.isFinite(valor)) {
-      throw new ErroDePedido(400, 'volume precisa ser um número entre 0 e 2');
+    if (!Number.isFinite(value)) {
+      throw new RequestError(400, 'volume precisa ser um número entre 0 e 2');
     }
 
-    sessao.definirVolume(valor);
-    responder(res, 200, { estado: sessao.estado() });
+    session.setVolume(value);
+    reply(res, 200, { state: session.state() });
     return;
   }
 
-  if (req.method === 'POST' && acao === 'limpar') {
-    sessao.limpar();
-    responder(res, 200, { estado: sessao.estado() });
+  if (req.method === 'POST' && action === 'clear') {
+    session.clear();
+    reply(res, 200, { state: session.state() });
     return;
   }
 
-  if (req.method === 'DELETE' && acao === 'fila' && partes[3]) {
-    const indice = Number(partes[3]);
+  if (req.method === 'DELETE' && action === 'queue' && parts[3]) {
+    const index = Number(parts[3]);
 
-    if (!Number.isInteger(indice) || indice < 0) {
-      throw new ErroDePedido(400, 'índice inválido');
+    if (!Number.isInteger(index) || index < 0) {
+      throw new RequestError(400, 'índice inválido');
     }
 
-    const removido = sessao.remover(indice);
-    responder(res, removido ? 200 : 404, {
-      removido,
-      estado: sessao.estado(),
-    });
+    const removed = session.remove(index);
+    reply(res, removed ? 200 : 404, { removed, state: session.state() });
     return;
   }
 
-  responder(res, 404, { erro: 'Rota desconhecida' });
+  reply(res, 404, { error: 'Rota desconhecida' });
 }

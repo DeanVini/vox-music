@@ -1,25 +1,25 @@
 import { config } from './config.js';
-import { criarServidor } from './http.js';
-import { Sessoes } from './session.js';
+import { createHttpServer } from './http.js';
+import { Sessions } from './session.js';
 
-const porta = Number(process.env.PORT ?? 8790);
-const segredo = process.env.CONTROL_SECRET ?? null;
+const port = Number(process.env.PORT ?? 8790);
+const secret = process.env.CONTROL_SECRET ?? null;
 
-const sessoes = new Sessoes();
-const servidor = criarServidor({ sessoes, segredo });
+const sessions = new Sessions();
+const server = createHttpServer({ sessions, secret });
 
-servidor.listen(porta, () => {
-  console.log(`vox-music ouvindo na porta ${porta}`);
+server.listen(port, () => {
+  console.log(`vox-music ouvindo na porta ${port}`);
   console.log(`livekit: ${config.livekitUrl}`);
-  if (!segredo) console.log('AVISO: sem CONTROL_SECRET, a API esta aberta');
+  if (!secret) console.log('AVISO: sem CONTROL_SECRET, a API esta aberta');
 });
 
-async function encerrar(sinal: string): Promise<void> {
-  console.log(`\n${sinal}: saindo das salas`);
-  servidor.close();
-  await sessoes.encerrarTudo();
+async function shutdown(signal: string): Promise<void> {
+  console.log(`\n${signal}: saindo das salas`);
+  server.close();
+  await sessions.closeAll();
   process.exit(0);
 }
 
-process.on('SIGINT', () => void encerrar('SIGINT'));
-process.on('SIGTERM', () => void encerrar('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));

@@ -2,48 +2,47 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
 
-const executar = promisify(execFile);
+const run = promisify(execFile);
 
-export interface Faixa {
+export interface Track {
   id: string;
-  titulo: string;
-  autor: string | null;
-  duracaoSegundos: number | null;
-  miniatura: string | null;
-  pagina: string;
-  origem: 'youtube' | 'soundcloud' | 'outra';
+  title: string;
+  author: string | null;
+  durationSeconds: number | null;
+  thumbnail: string | null;
+  page: string;
+  source: 'youtube' | 'soundcloud' | 'other';
 }
 
-const ENDERECO = /^https?:\/\//i;
+const URL_LIKE = /^https?:\/\//i;
 
-function alvoDe(consulta: string): string {
-  const texto = consulta.trim();
-  if (ENDERECO.test(texto)) return texto;
-  return `ytsearch1:${texto}`;
+function targetFor(query: string): string {
+  const text = query.trim();
+  return URL_LIKE.test(text) ? text : `ytsearch1:${text}`;
 }
 
-function origemDe(extrator: string): Faixa['origem'] {
-  if (extrator.startsWith('youtube')) return 'youtube';
-  if (extrator.startsWith('soundcloud')) return 'soundcloud';
-  return 'outra';
+function sourceOf(extractor: string): Track['source'] {
+  if (extractor.startsWith('youtube')) return 'youtube';
+  if (extractor.startsWith('soundcloud')) return 'soundcloud';
+  return 'other';
 }
 
-function primeiroObjeto(saida: string): Record<string, unknown> {
-  for (const linha of saida.split('\n')) {
-    const texto = linha.trim();
-    if (!texto.startsWith('{')) continue;
+function firstObject(output: string): Record<string, unknown> {
+  for (const line of output.split('\n')) {
+    const text = line.trim();
+    if (!text.startsWith('{')) continue;
 
-    const objeto = JSON.parse(texto) as Record<string, unknown>;
-    const entradas = objeto.entries as Record<string, unknown>[] | undefined;
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const entries = parsed.entries as Record<string, unknown>[] | undefined;
 
-    if (Array.isArray(entradas) && entradas.length > 0) return entradas[0]!;
-    return objeto;
+    if (Array.isArray(entries) && entries.length > 0) return entries[0]!;
+    return parsed;
   }
 
   throw new Error('Nada encontrado para essa busca');
 }
 
-export function argumentosBase(): string[] {
+export function baseArgs(): string[] {
   return [
     '--js-runtimes',
     'node',
@@ -54,33 +53,33 @@ export function argumentosBase(): string[] {
   ];
 }
 
-export async function resolver(consulta: string): Promise<Faixa> {
-  const { stdout } = await executar(
+export async function resolve(query: string): Promise<Track> {
+  const { stdout } = await run(
     config.ytdlp,
-    [...argumentosBase(), '--dump-json', alvoDe(consulta)],
+    [...baseArgs(), '--dump-json', targetFor(query)],
     { maxBuffer: 32 * 1024 * 1024, timeout: 45_000 },
   );
 
-  const dados = primeiroObjeto(stdout);
-  const duracao = dados.duration;
+  const data = firstObject(stdout);
+  const duration = data.duration;
 
   return {
-    id: String(dados.id ?? ''),
-    titulo: String(dados.title ?? 'Sem título'),
-    autor: dados.uploader ? String(dados.uploader) : null,
-    duracaoSegundos: typeof duracao === 'number' ? Math.round(duracao) : null,
-    miniatura: dados.thumbnail ? String(dados.thumbnail) : null,
-    pagina: String(dados.webpage_url ?? dados.original_url ?? consulta),
-    origem: origemDe(String(dados.extractor ?? '')),
+    id: String(data.id ?? ''),
+    title: String(data.title ?? 'Sem título'),
+    author: data.uploader ? String(data.uploader) : null,
+    durationSeconds: typeof duration === 'number' ? Math.round(duration) : null,
+    thumbnail: data.thumbnail ? String(data.thumbnail) : null,
+    page: String(data.webpage_url ?? data.original_url ?? query),
+    source: sourceOf(String(data.extractor ?? '')),
   };
 }
 
-export function duracaoLegivel(segundos: number | null): string {
-  if (segundos === null) return 'ao vivo';
+export function formatDuration(seconds: number | null): string {
+  if (seconds === null) return 'ao vivo';
 
-  const h = Math.floor(segundos / 3600);
-  const m = Math.floor((segundos % 3600) / 60);
-  const s = segundos % 60;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
 
   const pad = (n: number) => String(n).padStart(2, '0');
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;

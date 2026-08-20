@@ -2,48 +2,46 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import { AudioFrame, AudioSource } from '@livekit/rtc-node';
 import { config } from './config.js';
-import { argumentosBase } from './source.js';
+import { baseArgs } from './source.js';
 
-const BYTES_POR_AMOSTRA = 2;
-const BYTES_POR_QUADRO =
-  config.amostrasPorQuadro * config.canais * BYTES_POR_AMOSTRA;
+const BYTES_PER_SAMPLE = 2;
+const BYTES_PER_FRAME =
+  config.samplesPerFrame * config.channels * BYTES_PER_SAMPLE;
 
-export interface ResultadoDaReproducao {
-  motivo: 'fim' | 'parado' | 'erro';
-  erro?: string;
+export interface PlaybackResult {
+  reason: 'finished' | 'stopped' | 'error';
+  error?: string;
 }
 
-export class Reprodutor {
+export class Player {
   private ytdlp: ChildProcess | null = null;
   private ffmpeg: ChildProcess | null = null;
-  private parando = false;
+  private stopping = false;
   private volume = 1;
 
-  constructor(private readonly fonte: AudioSource) {}
+  constructor(private readonly source: AudioSource) {}
 
-  definirVolume(valor: number): void {
-    this.volume = Math.min(2, Math.max(0, valor));
+  setVolume(value: number): void {
+    this.volume = Math.min(2, Math.max(0, value));
   }
 
-  get volumeAtual(): number {
+  get currentVolume(): number {
     return this.volume;
   }
 
-  parar(): void {
-    this.parando = true;
+  stop(): void {
+    this.stopping = true;
     this.ytdlp?.kill('SIGKILL');
     this.ffmpeg?.kill('SIGKILL');
-    this.fonte.clearQueue();
+    this.source.clearQueue();
   }
 
-  async tocar(pagina: string): Promise<ResultadoDaReproducao> {
-    this.parando = false;
+  async play(page: string): Promise<PlaybackResult> {
+    this.stopping = false;
 
-    const ytdlp = spawn(
-      config.ytdlp,
-      [...argumentosBase(), '-o', '-', pagina],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    const ytdlp = spawn(config.ytdlp, [...baseArgs(), '-o', '-', page], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
     const ffmpeg = spawn(
       config.ffmpeg,
@@ -54,8 +52,8 @@ export class Reprodutor {
         '-vn',
         '-f', 's16le',
         '-acodec', 'pcm_s16le',
-        '-ar', String(config.taxaAmostragem),
-        '-ac', String(config.canais),
+        '-ar', String(config.sampleRate),
+        '-ac', String(config.channels),
         'pipe:1',
       ],
       { stdio: ['pipe', 'pipe', 'pipe'] },
@@ -64,103 +62,100 @@ export class Reprodutor {
     this.ytdlp = ytdlp;
     this.ffmpeg = ffmpeg;
 
-    const saidaDoYtdlp = ytdlp.stdout as Readable;
-    const saidaDoFfmpeg = ffmpeg.stdout as Readable;
+    const ytdlpOut = ytdlp.stdout as Readable;
+    const ffmpegOut = ffmpeg.stdout as Readable;
 
-    saidaDoYtdlp.pipe(ffmpeg.stdin!);
+    ytdlpOut.pipe(ffmpeg.stdin!);
 
-    let erroDeFfmpeg = '';
+    let ffmpegErrors = '';
     ffmpeg.stderr!.on('data', (d: Buffer) => {
-      erroDeFfmpeg += d.toString();
+      ffmpegErrors += d.toString();
     });
 
-    let erroDeYtdlp = '';
+    let ytdlpErrors = '';
     ytdlp.stderr!.on('data', (d: Buffer) => {
-      erroDeYtdlp += d.toString();
+      ytdlpErrors += d.toString();
     });
 
-    saidaDoYtdlp.on('error', () => undefined);
+    ytdlpOut.on('error', () => undefined);
     ffmpeg.stdin!.on('error', () => undefined);
 
     try {
-      await this.bombear(saidaDoFfmpeg);
-    } catch (causa) {
-      this.encerrar();
+      await this.pump(ffmpegOut);
+    } catch (cause) {
+      this.cleanup();
       return {
-        motivo: 'erro',
-        erro: motivoDetalhado(causa, erroDeYtdlp, erroDeFfmpeg),
+        reason: 'error',
+        error: describeFailure(cause, ytdlpErrors, ffmpegErrors),
       };
     }
 
-    const saiuComErro = await new Promise<number | null>((resolve) => {
+    const exitCode = await new Promise<number | null>((resolve) => {
       if (ffmpeg.exitCode !== null) return resolve(ffmpeg.exitCode);
-      ffmpeg.once('close', (codigo) => resolve(codigo));
+      ffmpeg.once('close', (code) => resolve(code));
     });
 
-    this.encerrar();
+    this.cleanup();
 
-    if (this.parando) return { motivo: 'parado' };
+    if (this.stopping) return { reason: 'stopped' };
 
-    if (saiuComErro !== 0 && saiuComErro !== null) {
-      const detalhe = (erroDeYtdlp + erroDeFfmpeg).trim().split('\n').at(-1);
-      return { motivo: 'erro', erro: detalhe ?? 'falha ao decodificar' };
+    if (exitCode !== 0 && exitCode !== null) {
+      const detail = (ytdlpErrors + ffmpegErrors).trim().split('\n').at(-1);
+      return { reason: 'error', error: detail ?? 'falha ao decodificar' };
     }
 
-    return { motivo: 'fim' };
+    return { reason: 'finished' };
   }
 
-  private async bombear(saida: Readable): Promise<void> {
-    let sobra: Uint8Array = new Uint8Array(0);
+  private async pump(output: Readable): Promise<void> {
+    let leftover: Uint8Array = new Uint8Array(0);
 
-    for await (const pedaco of saida) {
-      if (this.parando) return;
+    for await (const chunk of output) {
+      if (this.stopping) return;
 
-      const bloco = pedaco as Uint8Array;
-      if (sobra.length === 0) {
-        sobra = bloco;
+      const block = chunk as Uint8Array;
+      if (leftover.length === 0) {
+        leftover = block;
       } else {
-        const junto = new Uint8Array(sobra.length + bloco.length);
-        junto.set(sobra, 0);
-        junto.set(bloco, sobra.length);
-        sobra = junto;
+        const merged = new Uint8Array(leftover.length + block.length);
+        merged.set(leftover, 0);
+        merged.set(block, leftover.length);
+        leftover = merged;
       }
 
-      while (sobra.length >= BYTES_POR_QUADRO) {
-        const bloco = sobra.subarray(0, BYTES_POR_QUADRO);
-        sobra = sobra.subarray(BYTES_POR_QUADRO);
+      while (leftover.length >= BYTES_PER_FRAME) {
+        const frame = leftover.subarray(0, BYTES_PER_FRAME);
+        leftover = leftover.subarray(BYTES_PER_FRAME);
 
-        await this.enviar(bloco);
-        if (this.parando) return;
+        await this.send(frame);
+        if (this.stopping) return;
       }
     }
   }
 
-  private async enviar(bloco: Uint8Array): Promise<void> {
-    const amostras = new Int16Array(
-      bloco.buffer.slice(
-        bloco.byteOffset,
-        bloco.byteOffset + bloco.byteLength,
-      ),
+  private async send(block: Uint8Array): Promise<void> {
+    const samples = new Int16Array(
+      block.buffer.slice(block.byteOffset, block.byteOffset + block.byteLength),
     );
 
     if (this.volume !== 1) {
-      for (let i = 0; i < amostras.length; i++) {
-        const v = Math.round(amostras[i]! * this.volume);
-        amostras[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+      for (let i = 0; i < samples.length; i++) {
+        const scaled = Math.round(samples[i]! * this.volume);
+        samples[i] = scaled > 32767 ? 32767 : scaled < -32768 ? -32768 : scaled;
       }
     }
 
-    await this.fonte.captureFrame(
+    await this.source.captureFrame(
       new AudioFrame(
-        amostras,
-        config.taxaAmostragem,
-        config.canais,
-        config.amostrasPorQuadro,
+        samples,
+        config.sampleRate,
+        config.channels,
+        config.samplesPerFrame,
       ),
     );
   }
 
-  private encerrar(): void {
+  private cleanup(): void {
     this.ytdlp?.kill('SIGKILL');
     this.ffmpeg?.kill('SIGKILL');
     this.ytdlp = null;
@@ -168,12 +163,12 @@ export class Reprodutor {
   }
 }
 
-function motivoDetalhado(
-  causa: unknown,
+function describeFailure(
+  cause: unknown,
   ytdlp: string,
   ffmpeg: string,
 ): string {
-  const nativo = causa instanceof Error ? causa.message : String(causa);
-  const externo = (ytdlp + ffmpeg).trim().split('\n').at(-1);
-  return externo && externo.length > 0 ? externo : nativo;
+  const native = cause instanceof Error ? cause.message : String(cause);
+  const external = (ytdlp + ffmpeg).trim().split('\n').at(-1);
+  return external && external.length > 0 ? external : native;
 }

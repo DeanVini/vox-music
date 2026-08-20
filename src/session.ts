@@ -9,56 +9,57 @@ import {
 } from '@livekit/rtc-node';
 import { AudioEncoding } from '@livekit/rtc-ffi-bindings';
 import { config } from './config.js';
-import { Reprodutor } from './player.js';
-import type { Faixa } from './source.js';
+import { Player } from './player.js';
+import type { Track } from './source.js';
 
-export const TOPICO = 'vox:musica';
+export const TOPIC = 'vox:musica';
 
-export class FilaCheiaError extends Error {
-  constructor(readonly limite: number) {
-    super(`A fila já tem ${limite} músicas. Espere ou remova alguma.`);
+export class QueueFullError extends Error {
+  constructor(readonly limit: number) {
+    super(`A fila já tem ${limit} músicas. Espere ou remova alguma.`);
   }
 }
 
-export interface ItemDaFila extends Faixa {
-  pedidoPor: string;
+export interface QueueItem extends Track {
+  requestedBy: string;
 }
 
-export interface EstadoDaSessao {
-  sala: string;
-  tocando: ItemDaFila | null;
-  fila: ItemDaFila[];
-  pausado: boolean;
+export interface SessionState {
+  room: string;
+  playing: QueueItem | null;
+  queue: QueueItem[];
+  paused: boolean;
   volume: number;
-  desde: number | null;
+  since: number | null;
 }
 
-export class Sessao {
-  private readonly fila: ItemDaFila[] = [];
-  private atual: ItemDaFila | null = null;
-  private pausado = false;
-  private desde: number | null = null;
-  private laco: Promise<void> | null = null;
-  private encerrada = false;
-  private relogioDeOciosidade: ReturnType<typeof setTimeout> | null = null;
-  private aoSair: (() => void) | null = null;
+export class Session {
+  private readonly queue: QueueItem[] = [];
+  private current: QueueItem | null = null;
+  private paused = false;
+  private since: number | null = null;
+  private loop: Promise<void> | null = null;
+  private closed = false;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private onLeave: (() => void) | null = null;
+  private storedVolume = 1;
 
   private constructor(
-    readonly sala: string,
+    readonly roomName: string,
     private readonly room: Room,
-    private readonly fonte: AudioSource,
-    private readonly reprodutor: Reprodutor,
+    private readonly source: AudioSource,
+    private readonly player: Player,
   ) {}
 
-  static async entrar(sala: string): Promise<Sessao> {
+  static async join(roomName: string): Promise<Session> {
     const token = new AccessToken(config.livekitKey, config.livekitSecret, {
-      identity: config.identidade,
-      name: config.nome,
+      identity: config.identity,
+      name: config.displayName,
       ttl: 24 * 60 * 60,
     });
 
     token.addGrant({
-      room: sala,
+      room: roomName,
       roomJoin: true,
       canPublish: true,
       canSubscribe: false,
@@ -71,14 +72,14 @@ export class Sessao {
       dynacast: false,
     });
 
-    const fonte = new AudioSource(
-      config.taxaAmostragem,
-      config.canais,
-      config.filaDeAudioMs,
+    const source = new AudioSource(
+      config.sampleRate,
+      config.channels,
+      config.audioQueueMs,
     );
 
     await room.localParticipant!.publishTrack(
-      LocalAudioTrack.createAudioTrack('musica', fonte),
+      LocalAudioTrack.createAudioTrack('musica', source),
       new TrackPublishOptions({
         source: TrackSource.SOURCE_MICROPHONE,
         dtx: false,
@@ -87,194 +88,192 @@ export class Sessao {
       }),
     );
 
-    const sessao = new Sessao(sala, room, fonte, new Reprodutor(fonte));
+    const session = new Session(roomName, room, source, new Player(source));
 
-    room.on(RoomEvent.ParticipantDisconnected, () => sessao.conferirSala());
-    room.on(RoomEvent.ParticipantConnected, () => sessao.cancelarOciosidade());
+    room.on(RoomEvent.ParticipantDisconnected, () => session.checkRoom());
+    room.on(RoomEvent.ParticipantConnected, () => session.cancelIdle());
 
-    sessao.agendarOciosidade();
-    return sessao;
+    session.scheduleIdle();
+    return session;
   }
 
-  estado(): EstadoDaSessao {
+  state(): SessionState {
     return {
-      sala: this.sala,
-      tocando: this.atual,
-      fila: [...this.fila],
-      pausado: this.pausado,
-      volume: this.reprodutor.volumeAtual,
-      desde: this.desde,
+      room: this.roomName,
+      playing: this.current,
+      queue: [...this.queue],
+      paused: this.paused,
+      volume: this.player.currentVolume,
+      since: this.since,
     };
   }
 
-  adicionar(faixa: Faixa, pedidoPor: string): ItemDaFila {
-    const naFrente = this.fila.length + (this.atual ? 1 : 0);
-    if (naFrente >= config.limiteDaFila) {
-      throw new FilaCheiaError(config.limiteDaFila);
+  add(track: Track, requestedBy: string): QueueItem {
+    const ahead = this.queue.length + (this.current ? 1 : 0);
+    if (ahead >= config.queueLimit) {
+      throw new QueueFullError(config.queueLimit);
     }
 
-    const item: ItemDaFila = { ...faixa, pedidoPor };
-    this.fila.push(item);
-    this.cancelarOciosidade();
-    this.anunciar();
-    this.girar();
+    const item: QueueItem = { ...track, requestedBy };
+    this.queue.push(item);
+    this.cancelIdle();
+    this.announce();
+    this.spin();
     return item;
   }
 
-  pular(): boolean {
-    if (!this.atual) return false;
-    this.reprodutor.parar();
+  skip(): boolean {
+    if (!this.current) return false;
+    this.player.stop();
     return true;
   }
 
-  limpar(): void {
-    this.fila.length = 0;
-    this.anunciar();
+  clear(): void {
+    this.queue.length = 0;
+    this.announce();
   }
 
-  remover(indice: number): ItemDaFila | null {
-    const [removido] = this.fila.splice(indice, 1);
-    if (removido) this.anunciar();
-    return removido ?? null;
+  remove(index: number): QueueItem | null {
+    const [removed] = this.queue.splice(index, 1);
+    if (removed) this.announce();
+    return removed ?? null;
   }
 
-  pausar(valor: boolean): void {
-    this.pausado = valor;
-    this.reprodutor.definirVolume(valor ? 0 : this.volumeGuardado);
-    this.anunciar();
+  pause(value: boolean): void {
+    this.paused = value;
+    this.player.setVolume(value ? 0 : this.storedVolume);
+    this.announce();
   }
 
-  private volumeGuardado = 1;
-
-  definirVolume(valor: number): void {
-    this.volumeGuardado = Math.min(2, Math.max(0, valor));
-    if (!this.pausado) this.reprodutor.definirVolume(this.volumeGuardado);
-    this.anunciar();
+  setVolume(value: number): void {
+    this.storedVolume = Math.min(2, Math.max(0, value));
+    if (!this.paused) this.player.setVolume(this.storedVolume);
+    this.announce();
   }
 
-  async sair(): Promise<void> {
-    this.encerrada = true;
-    this.cancelarOciosidade();
-    this.fila.length = 0;
-    this.reprodutor.parar();
-    await this.laco?.catch(() => undefined);
-    await this.fonte.close().catch(() => undefined);
+  async leave(): Promise<void> {
+    this.closed = true;
+    this.cancelIdle();
+    this.queue.length = 0;
+    this.player.stop();
+    await this.loop?.catch(() => undefined);
+    await this.source.close().catch(() => undefined);
     await this.room.disconnect().catch(() => undefined);
   }
 
-  aoEncerrarSozinha(callback: () => void): void {
-    this.aoSair = callback;
+  onSelfClose(callback: () => void): void {
+    this.onLeave = callback;
   }
 
-  cancelarOciosidade(): void {
-    if (!this.relogioDeOciosidade) return;
-    clearTimeout(this.relogioDeOciosidade);
-    this.relogioDeOciosidade = null;
+  cancelIdle(): void {
+    if (!this.idleTimer) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = null;
   }
 
-  agendarOciosidade(): void {
-    this.cancelarOciosidade();
-    if (this.encerrada) return;
+  scheduleIdle(): void {
+    this.cancelIdle();
+    if (this.closed) return;
 
-    this.relogioDeOciosidade = setTimeout(() => {
-      this.relogioDeOciosidade = null;
-      if (this.atual || this.fila.length > 0) return;
-      this.aoSair?.();
-    }, config.ociosidadeMs);
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      if (this.current || this.queue.length > 0) return;
+      this.onLeave?.();
+    }, config.idleMs);
   }
 
-  conferirSala(): void {
-    if (this.encerrada) return;
+  checkRoom(): void {
+    if (this.closed) return;
     if (this.room.remoteParticipants.size > 0) return;
 
-    this.aoSair?.();
+    this.onLeave?.();
   }
 
-  private girar(): void {
-    if (this.laco || this.encerrada) return;
-    this.laco = this.rodar().finally(() => {
-      this.laco = null;
+  private spin(): void {
+    if (this.loop || this.closed) return;
+    this.loop = this.run().finally(() => {
+      this.loop = null;
     });
   }
 
-  private async rodar(): Promise<void> {
-    while (!this.encerrada) {
-      const proximo = this.fila.shift();
-      if (!proximo) break;
+  private async run(): Promise<void> {
+    while (!this.closed) {
+      const next = this.queue.shift();
+      if (!next) break;
 
-      this.atual = proximo;
-      this.desde = Date.now();
-      this.anunciar();
+      this.current = next;
+      this.since = Date.now();
+      this.announce();
 
-      const resultado = await this.reprodutor.tocar(proximo.pagina);
+      const result = await this.player.play(next.page);
 
-      if (resultado.motivo === 'erro') {
-        this.anunciarErro(proximo, resultado.erro ?? 'falha ao tocar');
+      if (result.reason === 'error') {
+        this.announceError(next, result.error ?? 'falha ao tocar');
       }
 
-      this.atual = null;
-      this.desde = null;
-      this.anunciar();
+      this.current = null;
+      this.since = null;
+      this.announce();
     }
 
-    this.agendarOciosidade();
+    this.scheduleIdle();
   }
 
-  private anunciar(): void {
-    this.enviar({ tipo: 'estado', estado: this.estado() });
+  private announce(): void {
+    this.publish({ type: 'state', state: this.state() });
   }
 
-  private anunciarErro(item: ItemDaFila, mensagem: string): void {
-    this.enviar({ tipo: 'erro', faixa: item.titulo, mensagem });
+  private announceError(item: QueueItem, message: string): void {
+    this.publish({ type: 'error', track: item.title, message });
   }
 
-  private enviar(carga: unknown): void {
-    if (this.encerrada) return;
+  private publish(payload: unknown): void {
+    if (this.closed) return;
 
-    const dados = new TextEncoder().encode(JSON.stringify(carga));
+    const data = new TextEncoder().encode(JSON.stringify(payload));
     void this.room.localParticipant
-      ?.publishData(dados, { reliable: true, topic: TOPICO })
+      ?.publishData(data, { reliable: true, topic: TOPIC })
       .catch(() => undefined);
   }
 }
 
-export class Sessoes {
-  private readonly porSala = new Map<string, Sessao>();
+export class Sessions {
+  private readonly byRoom = new Map<string, Session>();
 
-  async obter(sala: string): Promise<Sessao> {
-    const existente = this.porSala.get(sala);
-    if (existente) return existente;
+  async get(roomName: string): Promise<Session> {
+    const existing = this.byRoom.get(roomName);
+    if (existing) return existing;
 
-    const nova = await Sessao.entrar(sala);
-    this.porSala.set(sala, nova);
+    const created = await Session.join(roomName);
+    this.byRoom.set(roomName, created);
 
-    nova.aoEncerrarSozinha(() => {
-      if (this.porSala.get(sala) !== nova) return;
-      this.porSala.delete(sala);
-      void nova.sair();
+    created.onSelfClose(() => {
+      if (this.byRoom.get(roomName) !== created) return;
+      this.byRoom.delete(roomName);
+      void created.leave();
     });
 
-    return nova;
+    return created;
   }
 
-  atual(sala: string): Sessao | null {
-    return this.porSala.get(sala) ?? null;
+  current(roomName: string): Session | null {
+    return this.byRoom.get(roomName) ?? null;
   }
 
-  listar(): EstadoDaSessao[] {
-    return [...this.porSala.values()].map((s) => s.estado());
+  list(): SessionState[] {
+    return [...this.byRoom.values()].map((s) => s.state());
   }
 
-  async encerrar(sala: string): Promise<boolean> {
-    const sessao = this.porSala.get(sala);
-    if (!sessao) return false;
+  async close(roomName: string): Promise<boolean> {
+    const session = this.byRoom.get(roomName);
+    if (!session) return false;
 
-    this.porSala.delete(sala);
-    await sessao.sair();
+    this.byRoom.delete(roomName);
+    await session.leave();
     return true;
   }
 
-  async encerrarTudo(): Promise<void> {
-    await Promise.all([...this.porSala.keys()].map((s) => this.encerrar(s)));
+  async closeAll(): Promise<void> {
+    await Promise.all([...this.byRoom.keys()].map((r) => this.close(r)));
   }
 }

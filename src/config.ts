@@ -1,59 +1,59 @@
 import { existsSync, readFileSync } from 'node:fs';
 
-function carregarEnv(): void {
+function loadEnvFile(): void {
   if (!existsSync('.env')) return;
 
-  for (const linha of readFileSync('.env', 'utf8').split('\n')) {
-    const corte = linha.indexOf('=');
-    if (corte < 1 || linha.trimStart().startsWith('#')) continue;
+  for (const line of readFileSync('.env', 'utf8').split('\n')) {
+    const cut = line.indexOf('=');
+    if (cut < 1 || line.trimStart().startsWith('#')) continue;
 
-    const chave = linha.slice(0, corte).trim();
-    if (process.env[chave] === undefined) {
-      process.env[chave] = linha.slice(corte + 1).trim();
+    const key = line.slice(0, cut).trim();
+    if (process.env[key] === undefined) {
+      process.env[key] = line.slice(cut + 1).trim();
     }
   }
 }
 
-carregarEnv();
+loadEnvFile();
 
-function obrigatorio(chave: string): string {
-  const valor = process.env[chave];
-  if (!valor) throw new Error(`Falta a variável de ambiente ${chave}`);
-  return valor;
+function required(key: string): string {
+  const value = process.env[key];
+  if (!value) throw new Error(`Falta a variável de ambiente ${key}`);
+  return value;
 }
 
-async function acharFfmpeg(): Promise<string> {
+async function resolveFfmpeg(): Promise<string> {
   if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
 
   try {
-    const mod = await import('ffmpeg-static');
-    const caminho = (mod.default ?? mod) as unknown as string;
-    if (typeof caminho === 'string' && caminho.length > 0) return caminho;
+    const module = await import('ffmpeg-static');
+    const binary = (module.default ?? module) as unknown as string;
+    if (typeof binary === 'string' && binary.length > 0) return binary;
   } catch {
-    // sem o pacote, cai no binário do sistema
+    return 'ffmpeg';
   }
 
   return 'ffmpeg';
 }
 
 export const config = {
-  livekitUrl: obrigatorio('LIVEKIT_URL'),
-  livekitKey: obrigatorio('LIVEKIT_API_KEY'),
-  livekitSecret: obrigatorio('LIVEKIT_API_SECRET'),
+  livekitUrl: required('LIVEKIT_URL'),
+  livekitKey: required('LIVEKIT_API_KEY'),
+  livekitSecret: required('LIVEKIT_API_SECRET'),
 
   ytdlp: process.env.YTDLP_PATH ?? 'yt-dlp',
-  ffmpeg: await acharFfmpeg(),
+  ffmpeg: await resolveFfmpeg(),
 
-  identidade: process.env.BOT_IDENTITY ?? 'vox-musica',
-  nome: process.env.BOT_NAME ?? 'Vox Música',
+  identity: process.env.BOT_IDENTITY ?? 'vox-musica',
+  displayName: process.env.BOT_NAME ?? 'Vox Música',
 
-  taxaAmostragem: 48000,
-  canais: 2,
-  amostrasPorQuadro: 480,
-  filaDeAudioMs: 1000,
+  sampleRate: 48000,
+  channels: 2,
+  samplesPerFrame: 480,
+  audioQueueMs: 1000,
 
-  ociosidadeMs: Number(process.env.OCIOSIDADE_MS ?? 5 * 60_000),
-  limiteDaFila: Number(process.env.LIMITE_DA_FILA ?? 50),
+  idleMs: Number(process.env.IDLE_MS ?? 5 * 60_000),
+  queueLimit: Number(process.env.QUEUE_LIMIT ?? 50),
 };
 
 export type Config = typeof config;

@@ -29,31 +29,27 @@ próprio LiveKit, no tópico `vox:musica`, sem passar pela API do Vox.
 
 ## API
 
-Tudo em `/salas/{sala}`, com `Authorization: Bearer <CONTROL_SECRET>`.
+Tudo em `/rooms/{room}`, com `Authorization: Bearer <CONTROL_SECRET>`.
 
 | método | rota | o que faz |
 |---|---|---|
-| POST | `/buscar` | opções do YouTube e SoundCloud, intercaladas |
-| POST | `/tocar` | resolve e põe na fila |
-| POST | `/pular` | passa para a próxima |
-| POST | `/pausar` | pausa ou retoma |
+| POST | `/search` | opções do YouTube e SoundCloud, intercaladas |
+| POST | `/play` | resolve e põe na fila |
+| POST | `/skip` | passa para a próxima |
+| POST | `/pause` | pausa ou retoma |
 | POST | `/volume` | 0 a 2 |
-| POST | `/limpar` | esvazia a fila |
-| DELETE | `/fila/{indice}` | tira um item |
+| POST | `/clear` | esvazia a fila |
+| DELETE | `/queue/{index}` | tira um item |
 | GET | (raiz) | estado atual |
 | DELETE | (raiz) | tira o bot da sala |
 
-## Provas
+## Verificação
 
-Os arquivos `src/prova-*.ts` não são exemplos: eles medem o áudio que
+Os arquivos `src/verify-*.ts` não são exemplos: eles medem o áudio que
 realmente chega, com um segundo participante dentro da sala.
 
 ```bash
-npx tsx src/prova.ts             # o áudio atravessa o servidor
-npx tsx src/prova-musica.ts      # toca de verdade, e no ritmo certo
-npx tsx src/prova-busca.ts       # busca nas duas fontes
-npx tsx src/prova-integracao.ts  # a API inteira, ponta a ponta
-npx tsx src/prova-estereo.ts     # mostra a limitação de mono
+npx tsx src/verify-integration.ts   # a API inteira, ponta a ponta
 ```
 
 ## Limitação conhecida

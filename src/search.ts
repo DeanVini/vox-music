@@ -1,132 +1,138 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
-import type { Faixa } from './source.js';
+import type { Track } from './source.js';
 
-const executar = promisify(execFile);
+const run = promisify(execFile);
 
-export type Fonte = 'youtube' | 'soundcloud';
+export type Source = 'youtube' | 'soundcloud';
 
-export interface Opcao extends Faixa {
-  origem: Fonte;
-  previaCurta: boolean;
+export interface SearchOption extends Track {
+  source: Source;
+  shortPreview: boolean;
 }
 
-const PREFIXO: Record<Fonte, string> = {
+const PREFIX: Record<Source, string> = {
   youtube: 'ytsearch',
   soundcloud: 'scsearch',
 };
 
-function texto(valor: unknown): string | null {
-  if (valor === null || valor === undefined) return null;
-  const s = String(valor).trim();
-  return s.length > 0 ? s : null;
+function text(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const result = String(value).trim();
+  return result.length > 0 ? result : null;
 }
 
-function paginaDe(dados: Record<string, unknown>, fonte: Fonte): string | null {
-  const direto = texto(dados.webpage_url) ?? texto(dados.url);
-  if (direto?.startsWith('http')) return direto;
+function pageOf(data: Record<string, unknown>, source: Source): string | null {
+  const direct = text(data.webpage_url) ?? text(data.url);
+  if (direct?.startsWith('http')) return direct;
 
-  const id = texto(dados.id);
+  const id = text(data.id);
   if (!id) return null;
 
-  return fonte === 'youtube' ? `https://www.youtube.com/watch?v=${id}` : null;
+  return source === 'youtube'
+    ? `https://www.youtube.com/watch?v=${id}`
+    : null;
 }
 
-async function buscarEm(
-  fonte: Fonte,
-  consulta: string,
-  quantidade: number,
-): Promise<Opcao[]> {
-  const { stdout } = await executar(
+async function searchIn(
+  source: Source,
+  query: string,
+  amount: number,
+): Promise<SearchOption[]> {
+  const { stdout } = await run(
     config.ytdlp,
     [
       '--no-warnings',
       '--flat-playlist',
       '--dump-json',
-      `${PREFIXO[fonte]}${quantidade}:${consulta}`,
+      `${PREFIX[source]}${amount}:${query}`,
     ],
     { maxBuffer: 16 * 1024 * 1024, timeout: 25_000 },
   );
 
-  const opcoes: Opcao[] = [];
+  const options: SearchOption[] = [];
 
-  for (const linha of stdout.split('\n')) {
-    if (!linha.trim().startsWith('{')) continue;
+  for (const line of stdout.split('\n')) {
+    if (!line.trim().startsWith('{')) continue;
 
-    const dados = JSON.parse(linha) as Record<string, unknown>;
-    const pagina = paginaDe(dados, fonte);
-    if (!pagina) continue;
+    const data = JSON.parse(line) as Record<string, unknown>;
+    const page = pageOf(data, source);
+    if (!page) continue;
 
-    const bruta = dados.duration;
-    const duracao = typeof bruta === 'number' ? Math.round(bruta) : null;
+    const raw = data.duration;
+    const duration = typeof raw === 'number' ? Math.round(raw) : null;
 
-    opcoes.push({
-      id: texto(dados.id) ?? pagina,
-      titulo: texto(dados.title) ?? 'Sem título',
-      autor: texto(dados.uploader) ?? texto(dados.channel),
-      duracaoSegundos: duracao,
-      miniatura: texto(dados.thumbnail),
-      pagina,
-      origem: fonte,
-      previaCurta: fonte === 'soundcloud' && duracao !== null && duracao <= 31,
+    options.push({
+      id: text(data.id) ?? page,
+      title: text(data.title) ?? 'Sem título',
+      author: text(data.uploader) ?? text(data.channel),
+      durationSeconds: duration,
+      thumbnail: text(data.thumbnail),
+      page,
+      source,
+      shortPreview:
+        source === 'soundcloud' && duration !== null && duration <= 31,
     });
   }
 
-  return opcoes;
+  return options;
 }
 
-export async function buscar(
-  consulta: string,
-  opcoes: { porFonte?: number; fontes?: Fonte[] } = {},
-): Promise<{ resultados: Opcao[]; falhas: Partial<Record<Fonte, string>> }> {
-  const termo = consulta.trim();
-  if (termo.length === 0) return { resultados: [], falhas: {} };
+export async function search(
+  query: string,
+  options: { perSource?: number; sources?: Source[] } = {},
+): Promise<{
+  results: SearchOption[];
+  failures: Partial<Record<Source, string>>;
+}> {
+  const term = query.trim();
+  if (term.length === 0) return { results: [], failures: {} };
 
-  const fontes = opcoes.fontes ?? (['youtube', 'soundcloud'] as Fonte[]);
-  const porFonte = opcoes.porFonte ?? 5;
+  const sources = options.sources ?? (['youtube', 'soundcloud'] as Source[]);
+  const perSource = options.perSource ?? 5;
 
-  const respostas = await Promise.allSettled(
-    fontes.map((fonte) => buscarEm(fonte, termo, porFonte)),
+  const responses = await Promise.allSettled(
+    sources.map((source) => searchIn(source, term, perSource)),
   );
 
-  const resultados: Opcao[] = [];
-  const falhas: Partial<Record<Fonte, string>> = {};
+  const results: SearchOption[] = [];
+  const failures: Partial<Record<Source, string>> = {};
 
-  respostas.forEach((resposta, indice) => {
-    const fonte = fontes[indice]!;
+  responses.forEach((response, index) => {
+    const source = sources[index]!;
 
-    if (resposta.status === 'fulfilled') {
-      resultados.push(...resposta.value);
+    if (response.status === 'fulfilled') {
+      results.push(...response.value);
     } else {
-      const causa = resposta.reason;
-      falhas[fonte] =
-        causa instanceof Error ? causa.message : 'busca indisponível';
+      const cause = response.reason;
+      failures[source] =
+        cause instanceof Error ? cause.message : 'busca indisponível';
     }
   });
 
-  return { resultados: intercalar(resultados, fontes), falhas };
+  return { results: interleave(results, sources), failures };
 }
 
-function intercalar(resultados: Opcao[], fontes: Fonte[]): Opcao[] {
-  const porOrigem = new Map<Fonte, Opcao[]>(
-    fontes.map((f) => [f, resultados.filter((r) => r.origem === f)]),
+function interleave(results: SearchOption[], sources: Source[]): SearchOption[] {
+  const bySource = new Map<Source, SearchOption[]>(
+    sources.map((s) => [s, results.filter((r) => r.source === s)]),
   );
 
-  const juntos: Opcao[] = [];
-  let restam = true;
+  const merged: SearchOption[] = [];
+  let remaining = true;
 
-  for (let i = 0; restam; i++) {
-    restam = false;
+  for (let i = 0; remaining; i++) {
+    remaining = false;
 
-    for (const fonte of fontes) {
-      const item = porOrigem.get(fonte)?.[i];
+    for (const source of sources) {
+      const item = bySource.get(source)?.[i];
       if (item) {
-        juntos.push(item);
-        restam = true;
+        merged.push(item);
+        remaining = true;
       }
     }
   }
 
-  return juntos;
+  return merged;
 }
