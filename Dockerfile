@@ -9,6 +9,8 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:22-slim
 
+ARG BUILD_VERSION=desconhecida
+ENV BUILD_VERSION=$BUILD_VERSION
 ENV NODE_ENV=production \
     YTDLP_PATH=/usr/local/bin/yt-dlp \
     FFMPEG_PATH=/usr/bin/ffmpeg \

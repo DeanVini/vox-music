@@ -73,7 +73,11 @@ async function handle(
   const parts = url.pathname.split('/').filter(Boolean);
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    reply(res, 200, { ok: true, rooms: ctx.sessions.list().length });
+    reply(res, 200, {
+      ok: true,
+      rooms: ctx.sessions.list().length,
+      version: process.env.BUILD_VERSION ?? 'desconhecida',
+    });
     return;
   }
 

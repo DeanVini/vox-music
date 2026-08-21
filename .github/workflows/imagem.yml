@@ -48,6 +48,8 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
           tags: ${{ steps.nomes.outputs.tags }}
           labels: ${{ steps.nomes.outputs.labels }}
           cache-from: type=gha
